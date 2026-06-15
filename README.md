@@ -27,6 +27,42 @@ Exponential moving average algorithms continuously adjust miner reputation score
 ./start_miner.sh --wallet.name <coldkey-name> --wallet.hotkey <hotkey-name> --subtensor.network finney --netuid 83 --logging.info --axon.ip <your-miner-ip> --axon.port <your-miner-port>
 ```
 
+### Emmanuel ops / PM2
+Single-hotkey local solver:
+```
+CLIQUEAI_WALLET_NAME=main \
+CLIQUEAI_WALLET_HOTKEY=sn83_1 \
+CLIQUEAI_AXON_BASE_PORT=8083 \
+pm2 start miner.config.js
+```
+
+Multi-hotkey local solver:
+```
+CLIQUEAI_WALLET_NAME=main \
+CLIQUEAI_WALLET_HOTKEYS=sn83_1,sn83_2 \
+CLIQUEAI_AXON_PORTS=8083,8084 \
+pm2 start miner.config.js
+```
+
+Synth-style proxy mode, after a compatible target is verified:
+```
+CLIQUEAI_WALLET_NAME=main \
+CLIQUEAI_WALLET_HOTKEY=sn83_1 \
+CLIQUEAI_PROXY_ENABLED=true \
+CLIQUEAI_PROXY_HOST=<target-ip> \
+CLIQUEAI_PROXY_PORT=<target-port> \
+CLIQUEAI_PROXY_SPOOFED_HOTKEY=<validator-hotkey> \
+pm2 start miner.config.js
+```
+
+Operator-visible query logs:
+```
+✅ REAL VALIDATOR QUERY ARRIVED | hotkey=... ip=... uuid=... label=... nodes=...
+✅ PROXY SUCCESS | target=... clique_size=... elapsed=...s | ...
+✅ LOCAL SOLVE SUCCESS | clique_size=... elapsed=...s | ...
+❌ PROXY FAILED | ... | error=...
+```
+
 ### Validator
 ```
 ./start_validator.sh --wallet.name <coldkey-name> --wallet.hotkey <hotkey-name> --subtensor.network finney --netuid 83 --logging.info --axon.ip <your-validator-ip> --axon.port <your-validator-port>

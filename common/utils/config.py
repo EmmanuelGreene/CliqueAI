@@ -130,6 +130,37 @@ def add_miner_args(cls, parser):
         default=False,
     )
 
+    parser.add_argument(
+        "--neuron.proxy.enabled",
+        action="store_true",
+        help="Forward MaximumCliqueOfLambdaGraph requests to another CliqueAI axon instead of solving locally.",
+        default=False,
+    )
+    parser.add_argument(
+        "--neuron.proxy.host",
+        type=str,
+        help="Proxy target axon host/IP for MaximumCliqueOfLambdaGraph forwarding.",
+        default="",
+    )
+    parser.add_argument(
+        "--neuron.proxy.port",
+        type=int,
+        help="Proxy target axon port for MaximumCliqueOfLambdaGraph forwarding.",
+        default=0,
+    )
+    parser.add_argument(
+        "--neuron.proxy.timeout",
+        type=float,
+        help="HTTP timeout for proxy target requests.",
+        default=30.0,
+    )
+    parser.add_argument(
+        "--neuron.proxy.spoofed_hotkey",
+        type=str,
+        help="Optional validator hotkey to place in Synth-style proxy dendrite metadata.",
+        default="",
+    )
+
 
 def add_validator_args(cls, parser):
     """Add validator specific arguments to the parser."""

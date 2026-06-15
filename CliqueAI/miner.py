@@ -1,7 +1,10 @@
+import asyncio
 import time
 import typing
+import uuid
 
 import bittensor as bt
+import httpx
 from CliqueAI.clique_algorithms import networkx_algorithm
 from CliqueAI.graph.codec import GraphCodec
 from CliqueAI.protocol import MaximumCliqueOfLambdaGraph
@@ -19,15 +22,122 @@ class Miner(BaseMinerNeuron):
 
     def __init__(self, config=None):
         super().__init__(config=config)
+        self.proxy_enabled = bool(self.config.neuron.proxy.enabled)
+        self.proxy_target_host = str(self.config.neuron.proxy.host or "")
+        self.proxy_target_port = int(self.config.neuron.proxy.port or 0)
+        if self.proxy_enabled:
+            if not self.proxy_target_host or not self.proxy_target_port:
+                raise ValueError(
+                    "Proxy mode requires --neuron.proxy.host and --neuron.proxy.port"
+                )
+            bt.logging.info(
+                "CliqueAI Synth-style proxy enabled: "
+                f"{self.proxy_target_host}:{self.proxy_target_port}"
+            )
         self.axon.attach(
             forward_fn=self.forward_graph,
             blacklist_fn=self.backlist_graph,
             priority_fn=self.priority_graph,
         )
 
+    def _short_hotkey(self, hotkey: str) -> str:
+        if not hotkey:
+            return "unknown"
+        return hotkey if len(hotkey) <= 14 else f"{hotkey[:7]}...{hotkey[-7:]}"
+
+    def _incoming_query_log_context(
+        self, synapse: MaximumCliqueOfLambdaGraph
+    ) -> str:
+        dendrite = getattr(synapse, "dendrite", None)
+        hotkey = str(getattr(dendrite, "hotkey", "") or "")
+        ip = str(getattr(dendrite, "ip", "") or "unknown")
+        port = getattr(dendrite, "port", "unknown")
+        request_uuid = str(getattr(synapse, "uuid", "") or "unknown")
+        nonce = getattr(dendrite, "nonce", "unknown")
+        return (
+            f"hotkey={self._short_hotkey(hotkey)} ip={ip}:{port} "
+            f"uuid={request_uuid} nonce={nonce} "
+            f"label={synapse.label or 'unknown'} nodes={synapse.number_of_nodes}"
+        )
+
+    def _proxy_forward_http_sync(
+        self, synapse: MaximumCliqueOfLambdaGraph
+    ) -> list[int]:
+        incoming = getattr(synapse, "dendrite", None)
+        spoofed_hotkey = str(getattr(self.config.neuron.proxy, "spoofed_hotkey", "") or "")
+        dendrite_hotkey = spoofed_hotkey or str(getattr(incoming, "hotkey", "") or "")
+
+        proxy_synapse = MaximumCliqueOfLambdaGraph(
+            uuid=synapse.uuid,
+            label=synapse.label,
+            number_of_nodes=synapse.number_of_nodes,
+            encoded_matrix=synapse.encoded_matrix,
+            maximum_clique=[],
+            timeout=synapse.timeout,
+        )
+        proxy_synapse.dendrite = bt.TerminalInfo(
+            ip=str(getattr(incoming, "ip", "127.0.0.1") or "127.0.0.1"),
+            port=int(getattr(incoming, "port", 0) or 0),
+            version=int(getattr(incoming, "version", 0) or 0),
+            nonce=int(getattr(incoming, "nonce", time.time_ns()) or time.time_ns()),
+            uuid=str(getattr(incoming, "uuid", "") or uuid.uuid4()),
+            hotkey=dendrite_hotkey,
+        )
+
+        headers = proxy_synapse.to_headers()
+        headers["timeout"] = str(float(self.config.neuron.proxy.timeout))
+        headers["name"] = "MaximumCliqueOfLambdaGraph"
+        headers.pop("bt_header_dendrite_signature", None)
+
+        body = proxy_synapse.model_dump()
+        if isinstance(body.get("dendrite"), dict):
+            body["dendrite"].pop("signature", None)
+
+        url = f"http://{self.proxy_target_host}:{self.proxy_target_port}/MaximumCliqueOfLambdaGraph"
+        response = httpx.post(
+            url,
+            json=body,
+            headers=headers,
+            timeout=float(self.config.neuron.proxy.timeout),
+        )
+        if response.status_code != 200:
+            raise RuntimeError(
+                f"Proxy target HTTP {response.status_code}: {response.text[:300]}"
+            )
+
+        data = response.json()
+        maximum_clique = data.get("maximum_clique")
+        if not isinstance(maximum_clique, list):
+            raise RuntimeError(f"Proxy target returned no maximum_clique; keys={sorted(data.keys())}")
+        return maximum_clique
+
+    async def _proxy_forward(
+        self, synapse: MaximumCliqueOfLambdaGraph
+    ) -> MaximumCliqueOfLambdaGraph:
+        synapse.maximum_clique = await asyncio.to_thread(
+            self._proxy_forward_http_sync, synapse
+        )
+        return synapse
+
     async def forward_graph(
         self, synapse: MaximumCliqueOfLambdaGraph
     ) -> MaximumCliqueOfLambdaGraph:
+        start_time = time.time()
+        query_context = self._incoming_query_log_context(synapse)
+        bt.logging.info(f"✅ REAL VALIDATOR QUERY ARRIVED | {query_context}")
+
+        if self.proxy_enabled:
+            try:
+                proxied = await self._proxy_forward(synapse)
+                target = f"{self.proxy_target_host}:{self.proxy_target_port}"
+                bt.logging.info(
+                    f"✅ PROXY SUCCESS | target={target} clique_size={len(proxied.maximum_clique)} "
+                    f"elapsed={time.time() - start_time:.2f}s | {query_context}"
+                )
+                return proxied
+            except Exception as e:
+                bt.logging.error(f"❌ PROXY FAILED | {query_context} | error={e}")
+
         codec = GraphCodec()
         adjacency_matrix = codec.decode_matrix(synapse.encoded_matrix)
         adjacency_list = codec.matrix_to_list(adjacency_matrix)
@@ -36,7 +146,8 @@ class Miner(BaseMinerNeuron):
         # from CliqueAI.clique_algorithms import scattering_clique_algorithm
         # maximum_clique = scattering_clique_algorithm(synapse.number_of_nodes, adjacency_list)
         bt.logging.info(
-            f"Maximum clique found: {maximum_clique} with size {len(maximum_clique)}"
+            f"✅ LOCAL SOLVE SUCCESS | clique_size={len(maximum_clique)} "
+            f"elapsed={time.time() - start_time:.2f}s | {query_context}"
         )
         synapse.maximum_clique = maximum_clique
         return synapse
