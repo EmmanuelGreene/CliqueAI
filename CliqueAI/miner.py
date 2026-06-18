@@ -87,11 +87,15 @@ class Miner(BaseMinerNeuron):
         headers = proxy_synapse.to_headers()
         headers["timeout"] = str(float(self.config.neuron.proxy.timeout))
         headers["name"] = "MaximumCliqueOfLambdaGraph"
-        headers.pop("bt_header_dendrite_signature", None)
+        # CliqueAI targets accept validator-like dendrite metadata when the
+        # signature field is present but empty. This matches the successful
+        # SN83 target probes from Synth VPS and avoids the invalid-format path
+        # returned by literal values such as "None".
+        headers["bt_header_dendrite_signature"] = ""
 
         body = proxy_synapse.model_dump()
         if isinstance(body.get("dendrite"), dict):
-            body["dendrite"].pop("signature", None)
+            body["dendrite"]["signature"] = ""
 
         url = f"http://{self.proxy_target_host}:{self.proxy_target_port}/MaximumCliqueOfLambdaGraph"
         response = httpx.post(
