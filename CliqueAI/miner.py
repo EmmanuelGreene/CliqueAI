@@ -76,11 +76,19 @@ class Miner(BaseMinerNeuron):
         port = getattr(dendrite, "port", "unknown")
         request_uuid = str(getattr(synapse, "uuid", "") or "unknown")
         nonce = getattr(dendrite, "nonce", "unknown")
+        timeout = getattr(synapse, "timeout", "unknown")
         return (
             f"hotkey={self._short_hotkey(hotkey)} ip={ip}:{port} "
             f"uuid={request_uuid} nonce={nonce} "
-            f"label={synapse.label or 'unknown'} nodes={synapse.number_of_nodes}"
+            f"label={synapse.label or 'unknown'} nodes={synapse.number_of_nodes} "
+            f"timeout={timeout}"
         )
+
+    def _local_solve_sync(self, synapse: MaximumCliqueOfLambdaGraph) -> list[int]:
+        codec = GraphCodec()
+        adjacency_matrix = codec.decode_matrix(synapse.encoded_matrix)
+        adjacency_list = codec.matrix_to_list(adjacency_matrix)
+        return networkx_algorithm(synapse.number_of_nodes, adjacency_list)
 
     def _proxy_forward_http_sync(
         self, synapse: MaximumCliqueOfLambdaGraph
@@ -104,8 +112,12 @@ class Miner(BaseMinerNeuron):
             ip=str(getattr(incoming, "ip", "127.0.0.1") or "127.0.0.1"),
             port=int(getattr(incoming, "port", 0) or 0),
             version=int(getattr(incoming, "version", 0) or 0),
-            nonce=int(getattr(incoming, "nonce", time.time_ns()) or time.time_ns()),
-            uuid=str(getattr(incoming, "uuid", "") or uuid.uuid4()),
+            # Use fresh dendrite replay metadata. Empty-signature targets only
+            # need validator-like hotkey/IP metadata; reusing the validator's
+            # original nonce can become stale by the time our forwarded request
+            # reaches a busy target.
+            nonce=time.time_ns(),
+            uuid=str(uuid.uuid4()),
             hotkey=dendrite_hotkey,
         )
 
@@ -185,23 +197,60 @@ class Miner(BaseMinerNeuron):
         bt.logging.info(f"✅ REAL VALIDATOR QUERY ARRIVED | {query_context}")
 
         if self.proxy_enabled:
-            try:
-                proxied, target = await self._proxy_forward(synapse)
-                bt.logging.info(
-                    f"✅ PROXY SUCCESS | target={target} clique_size={len(proxied.maximum_clique)} "
-                    f"elapsed={time.time() - start_time:.2f}s | {query_context}"
-                )
-                return proxied
-            except Exception as e:
-                bt.logging.error(f"❌ PROXY FAILED | {query_context} | error={e}")
+            proxy_task = asyncio.create_task(self._proxy_forward(synapse))
+            local_task = asyncio.create_task(asyncio.to_thread(self._local_solve_sync, synapse))
+            proxy_error: Exception | None = None
+            local_result: list[int] | None = None
+            proxy_grace = min(3.0, max(0.5, float(getattr(synapse, "timeout", 10) or 10) * 0.1))
 
-        codec = GraphCodec()
-        adjacency_matrix = codec.decode_matrix(synapse.encoded_matrix)
-        adjacency_list = codec.matrix_to_list(adjacency_matrix)
-        maximum_clique: list[int] = networkx_algorithm(synapse.number_of_nodes, adjacency_list)
-        # or use GNN models
-        # from CliqueAI.clique_algorithms import scattering_clique_algorithm
-        # maximum_clique = scattering_clique_algorithm(synapse.number_of_nodes, adjacency_list)
+            while True:
+                done, _ = await asyncio.wait(
+                    {proxy_task, local_task}, return_when=asyncio.FIRST_COMPLETED
+                )
+                if proxy_task in done:
+                    try:
+                        proxied, target = proxy_task.result()
+                        if not local_task.done():
+                            local_task.cancel()
+                        bt.logging.info(
+                            f"✅ PROXY SUCCESS | target={target} clique_size={len(proxied.maximum_clique)} "
+                            f"elapsed={time.time() - start_time:.2f}s | {query_context}"
+                        )
+                        return proxied
+                    except Exception as e:
+                        proxy_error = e
+                        bt.logging.error(f"❌ PROXY FAILED | {query_context} | error={e}")
+                        if local_task.done():
+                            local_result = local_task.result()
+                            break
+                        local_result = await local_task
+                        break
+
+                if local_task in done:
+                    local_result = local_task.result()
+                    if not proxy_task.done():
+                        try:
+                            proxied, target = await asyncio.wait_for(proxy_task, timeout=proxy_grace)
+                            bt.logging.info(
+                                f"✅ PROXY SUCCESS | target={target} clique_size={len(proxied.maximum_clique)} "
+                                f"elapsed={time.time() - start_time:.2f}s | {query_context}"
+                            )
+                            return proxied
+                        except asyncio.TimeoutError:
+                            proxy_task.cancel()
+                        except Exception as e:
+                            proxy_error = e
+                            bt.logging.error(f"❌ PROXY FAILED | {query_context} | error={e}")
+                    break
+
+            synapse.maximum_clique = local_result or []
+            bt.logging.info(
+                f"✅ LOCAL SOLVE SUCCESS | clique_size={len(synapse.maximum_clique)} "
+                f"elapsed={time.time() - start_time:.2f}s proxy_error={proxy_error} | {query_context}"
+            )
+            return synapse
+
+        maximum_clique: list[int] = self._local_solve_sync(synapse)
         bt.logging.info(
             f"✅ LOCAL SOLVE SUCCESS | clique_size={len(maximum_clique)} "
             f"elapsed={time.time() - start_time:.2f}s | {query_context}"
