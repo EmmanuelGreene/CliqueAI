@@ -153,24 +153,29 @@ class Miner(BaseMinerNeuron):
     ) -> tuple[float, str]:
         """Return how long to wait for proxy after a valid local answer is ready.
 
-        Proxy racing is only useful when a target actually wins sometimes.  If the
-        live targets have been missing repeatedly, a fixed 3s grace turns strong
-        local answers into slower answers.  Keep an initial/default grace while
-        probing, but shrink it after a miss streak until a proxy success resets
-        the streak.
+        Live target reliability was poor, but Emmanuel wants maximum safe proxy
+        usage.  We therefore use timeout-bucketed grace: short enough to protect
+        validator deadlines, long enough to measure and select useful proxy
+        answers when the target is only slightly slower than local.
         """
-        base = min(3.0, max(0.5, validator_timeout * 0.1)) if validator_timeout > 0 else 1.0
-        if self._proxy_miss_streak >= 3:
-            if validator_timeout > 0 and validator_timeout <= 10.0:
-                return min(base, 0.15), "proxy-miss-streak-short-timeout"
-            return min(base, 0.50), "proxy-miss-streak"
-        if self._proxy_success_count < 3 or self._proxy_miss_streak > 0:
-            if validator_timeout > 0 and validator_timeout <= 10.0:
-                return min(base, 0.25), "limited-proxy-evidence-short-timeout"
-            return min(base, 0.75), "limited-proxy-evidence"
+        if validator_timeout > 0:
+            base = min(6.0, max(0.75, validator_timeout * 0.2))
+        else:
+            base = 1.0
+
+        # Emmanuel wants to proxy as much as practical.  Keep 6s jobs protected,
+        # but give the target a real chance on 7.5s/10s and especially 15s/30s
+        # requests.  Shadow logging below tells us whether late proxy answers are
+        # better than local so we can tighten/loosen these buckets with evidence.
+        if validator_timeout > 0 and validator_timeout <= 6.0:
+            return min(base, 0.50), "aggressive-proxy-6s"
+        if validator_timeout > 0 and validator_timeout <= 10.0:
+            return min(base, 1.00), "aggressive-proxy-short"
+        if validator_timeout > 0 and validator_timeout <= 15.0:
+            return min(base, 2.50), "aggressive-proxy-medium"
         if local_elapsed is not None and validator_timeout > 0 and local_elapsed >= validator_timeout * 0.75:
-            return min(base, 0.25), "protect-deadline"
-        return base, "default"
+            return min(base, 1.00), "protect-deadline"
+        return base, "aggressive-proxy-long"
 
     def _record_proxy_success(self, target: str) -> None:
         self._proxy_success_count += 1
@@ -349,7 +354,9 @@ class Miner(BaseMinerNeuron):
             validator_timeout = float(getattr(synapse, "timeout", 0) or 0)
             safety_buffer = min(1.0, max(0.25, validator_timeout * 0.05)) if validator_timeout > 0 else 0.5
             deadline = start_time + max(0.5, validator_timeout - safety_buffer) if validator_timeout > 0 else None
-            proxy_task = asyncio.create_task(self._proxy_forward(synapse))
+            proxy_task = asyncio.create_task(
+                asyncio.to_thread(self._proxy_forward_http_sync, synapse)
+            )
             local_deadline = None
             if deadline is not None:
                 local_deadline = time.perf_counter() + max(0.05, deadline - time.time())
@@ -383,7 +390,7 @@ class Miner(BaseMinerNeuron):
                     continue
                 if proxy_task in done:
                     try:
-                        proxied, target = proxy_task.result()
+                        proxy_clique, target = proxy_task.result()
                         self._record_proxy_success(target)
                         if not local_task.done():
                             remaining = remaining_budget()
@@ -394,22 +401,23 @@ class Miner(BaseMinerNeuron):
                                 await asyncio.wait({local_task}, timeout=compare_grace)
                         if local_task.done():
                             local_candidate, local_elapsed = local_task.result()
-                            if self._is_valid_clique(synapse, local_candidate) and len(local_candidate) >= len(proxied.maximum_clique):
+                            if self._is_valid_clique(synapse, local_candidate) and len(local_candidate) >= len(proxy_clique):
                                 synapse.maximum_clique = local_candidate
                                 bt.logging.info(
                                     f"✅ LOCAL BEATS EARLY PROXY | local_clique_size={len(local_candidate)} "
-                                    f"proxy_target={target} proxy_clique_size={len(proxied.maximum_clique)} "
+                                    f"proxy_target={target} proxy_clique_size={len(proxy_clique)} "
                                     f"elapsed={time.time() - start_time:.2f}s local_elapsed={local_elapsed:.2f}s "
                                     f"target_stats={self._proxy_target_summary()} | {query_context}"
                                 )
                                 return synapse
                         else:
                             local_task.cancel()
+                        synapse.maximum_clique = proxy_clique
                         bt.logging.info(
-                            f"✅ PROXY SUCCESS | target={target} clique_size={len(proxied.maximum_clique)} "
+                            f"✅ PROXY SUCCESS | target={target} clique_size={len(proxy_clique)} "
                             f"elapsed={time.time() - start_time:.2f}s target_stats={self._proxy_target_summary()} | {query_context}"
                         )
-                        return proxied
+                        return synapse
                     except Exception as e:
                         proxy_error = e
                         self._record_proxy_miss()
@@ -448,20 +456,45 @@ class Miner(BaseMinerNeuron):
                         )
                         grace = adaptive_grace if remaining is None else min(adaptive_grace, remaining)
                         try:
-                            proxied, target = await asyncio.wait_for(proxy_task, timeout=grace)
+                            proxy_clique, target = await asyncio.wait_for(asyncio.shield(proxy_task), timeout=grace)
                             self._record_proxy_success(target)
+                            synapse.maximum_clique = proxy_clique
                             bt.logging.info(
-                                f"✅ PROXY SUCCESS | target={target} clique_size={len(proxied.maximum_clique)} "
+                                f"✅ PROXY SUCCESS | target={target} clique_size={len(proxy_clique)} "
                                 f"elapsed={time.time() - start_time:.2f}s grace={grace:.2f}s "
                                 f"grace_policy={grace_policy} target_stats={self._proxy_target_summary()} | {query_context}"
                             )
-                            return proxied
+                            return synapse
                         except asyncio.TimeoutError:
                             self._record_proxy_miss()
                             proxy_error = TimeoutError(
                                 f"proxy still pending after local result + {grace:.2f}s grace"
                             )
-                            proxy_task.cancel()
+                            local_size = len(local_result or [])
+
+                            def _log_shadow_proxy_result(
+                                task: asyncio.Task[tuple[list[int], str]],
+                                local_size: int = local_size,
+                                query_context: str = query_context,
+                                shadow_started: float = start_time,
+                            ) -> None:
+                                try:
+                                    proxy_clique, target = task.result()
+                                    delta = len(proxy_clique) - local_size
+                                    bt.logging.info(
+                                        f"🧪 SHADOW PROXY COMPLETED | target={target} "
+                                        f"proxy_clique_size={len(proxy_clique)} local_clique_size={local_size} "
+                                        f"delta={delta:+d} elapsed={time.time() - shadow_started:.2f}s | {query_context}"
+                                    )
+                                except asyncio.CancelledError:
+                                    pass
+                                except Exception as exc:
+                                    bt.logging.info(
+                                        f"🧪 SHADOW PROXY FAILED | local_clique_size={local_size} "
+                                        f"elapsed={time.time() - shadow_started:.2f}s error={exc} | {query_context}"
+                                    )
+
+                            proxy_task.add_done_callback(_log_shadow_proxy_result)
                             bt.logging.info(
                                 f"⏱️ PROXY STILL PENDING | using local fallback "
                                 f"elapsed={time.time() - start_time:.2f}s grace={grace:.2f}s "
