@@ -90,6 +90,26 @@ class Miner(BaseMinerNeuron):
         adjacency_list = codec.matrix_to_list(adjacency_matrix)
         return networkx_algorithm(synapse.number_of_nodes, adjacency_list)
 
+    def _is_valid_clique(
+        self, synapse: MaximumCliqueOfLambdaGraph, maximum_clique: typing.Any
+    ) -> bool:
+        if not isinstance(maximum_clique, list):
+            return False
+        if len(maximum_clique) != len(set(maximum_clique)):
+            return False
+        if any(not isinstance(node, int) for node in maximum_clique):
+            return False
+        if any(node < 0 or node >= synapse.number_of_nodes for node in maximum_clique):
+            return False
+
+        codec = GraphCodec()
+        adjacency_matrix = codec.decode_matrix(synapse.encoded_matrix)
+        for index, left in enumerate(maximum_clique):
+            for right in maximum_clique[index + 1 :]:
+                if not adjacency_matrix[left][right]:
+                    return False
+        return True
+
     def _proxy_forward_http_sync(
         self, synapse: MaximumCliqueOfLambdaGraph
     ) -> tuple[list[int], str]:
@@ -156,6 +176,10 @@ class Miner(BaseMinerNeuron):
                 raise RuntimeError(
                     f"{target_label} returned no maximum_clique; keys={sorted(data.keys())}"
                 )
+            if not self._is_valid_clique(synapse, maximum_clique):
+                raise RuntimeError(
+                    f"{target_label} returned invalid clique size={len(maximum_clique)}"
+                )
             return maximum_clique, target_label
 
         errors: list[str] = []
@@ -201,12 +225,34 @@ class Miner(BaseMinerNeuron):
             local_task = asyncio.create_task(asyncio.to_thread(self._local_solve_sync, synapse))
             proxy_error: Exception | None = None
             local_result: list[int] | None = None
-            proxy_grace = min(3.0, max(0.5, float(getattr(synapse, "timeout", 10) or 10) * 0.1))
+            validator_timeout = float(getattr(synapse, "timeout", 0) or 0)
+            safety_buffer = min(1.0, max(0.25, validator_timeout * 0.05)) if validator_timeout > 0 else 0.5
+            deadline = start_time + max(0.5, validator_timeout - safety_buffer) if validator_timeout > 0 else None
+            proxy_grace = min(3.0, max(0.5, validator_timeout * 0.1)) if validator_timeout > 0 else 1.0
+
+            def remaining_budget() -> float | None:
+                if deadline is None:
+                    return None
+                return max(0.0, deadline - time.time())
 
             while True:
+                remaining = remaining_budget()
+                if remaining is not None and remaining <= 0:
+                    proxy_task.cancel()
+                    local_task.cancel()
+                    bt.logging.warning(
+                        f"⚠️ DEADLINE EXHAUSTED | returning empty before validator timeout "
+                        f"elapsed={time.time() - start_time:.2f}s buffer={safety_buffer:.2f}s | {query_context}"
+                    )
+                    synapse.maximum_clique = []
+                    return synapse
                 done, _ = await asyncio.wait(
-                    {proxy_task, local_task}, return_when=asyncio.FIRST_COMPLETED
+                    {proxy_task, local_task},
+                    return_when=asyncio.FIRST_COMPLETED,
+                    timeout=remaining,
                 )
+                if not done:
+                    continue
                 if proxy_task in done:
                     try:
                         proxied, target = proxy_task.result()
@@ -223,14 +269,35 @@ class Miner(BaseMinerNeuron):
                         if local_task.done():
                             local_result = local_task.result()
                             break
-                        local_result = await local_task
-                        break
+                        remaining = remaining_budget()
+                        if remaining is None:
+                            local_result = await local_task
+                            break
+                        try:
+                            local_result = await asyncio.wait_for(local_task, timeout=remaining)
+                            break
+                        except asyncio.TimeoutError:
+                            local_task.cancel()
+                            bt.logging.warning(
+                                f"⚠️ LOCAL FALLBACK MISSED DEADLINE | "
+                                f"elapsed={time.time() - start_time:.2f}s buffer={safety_buffer:.2f}s "
+                                f"proxy_error={proxy_error} | {query_context}"
+                            )
+                            synapse.maximum_clique = []
+                            return synapse
 
                 if local_task in done:
                     local_result = local_task.result()
+                    if not self._is_valid_clique(synapse, local_result):
+                        local_result = []
+                        bt.logging.warning(
+                            f"⚠️ LOCAL SOLVE INVALID CLIQUE | elapsed={time.time() - start_time:.2f}s | {query_context}"
+                        )
                     if not proxy_task.done():
                         try:
-                            proxied, target = await asyncio.wait_for(proxy_task, timeout=proxy_grace)
+                            remaining = remaining_budget()
+                            grace = proxy_grace if remaining is None else min(proxy_grace, remaining)
+                            proxied, target = await asyncio.wait_for(proxy_task, timeout=grace)
                             bt.logging.info(
                                 f"✅ PROXY SUCCESS | target={target} clique_size={len(proxied.maximum_clique)} "
                                 f"elapsed={time.time() - start_time:.2f}s | {query_context}"
