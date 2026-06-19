@@ -142,13 +142,28 @@ def anytime_clique_algorithm(
     rng = random.Random(seed)
 
     # Try strong starts from high-degree vertices first, then randomized restarts.
-    seed_nodes = order[: min(number_of_nodes, 96)]
+    seed_nodes = order[: min(number_of_nodes, 160)]
     idx = 0
-    sample_width = 6 if number_of_nodes < 600 else 8
+    sample_width = 6 if number_of_nodes < 600 else 10
     attempts = 0
     last_improved = time.perf_counter()
-    stagnation_limit = 0.35 if number_of_nodes < 400 else 0.75
-    minimum_runtime = min(max(0.15, budget * 0.15), 1.25)
+    if number_of_nodes >= 850:
+        effort_fraction = 0.45
+        effort_cap = 6.0
+        stagnation_limit = 1.75
+    elif number_of_nodes >= 650:
+        effort_fraction = 0.35
+        effort_cap = 4.0
+        stagnation_limit = 1.25
+    elif number_of_nodes >= 450:
+        effort_fraction = 0.30
+        effort_cap = 3.0
+        stagnation_limit = 0.90
+    else:
+        effort_fraction = 0.20
+        effort_cap = 1.50
+        stagnation_limit = 0.45
+    minimum_runtime = min(max(0.15, budget * effort_fraction), effort_cap)
     while time.perf_counter() < deadline:
         attempts += 1
         if idx < len(seed_nodes):
