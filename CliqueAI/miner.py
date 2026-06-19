@@ -156,6 +156,18 @@ class Miner(BaseMinerNeuron):
                 parts.append(f"{label}=w{wins}/f{fails}")
         return ",".join(parts) or "none"
 
+    def _min_proxy_clique_size(self, number_of_nodes: int) -> int:
+        """Reject obviously weak proxy answers so local fallback can compete."""
+        if number_of_nodes >= 850:
+            return 24
+        if number_of_nodes >= 650:
+            return 24
+        if number_of_nodes >= 450:
+            return 20
+        if number_of_nodes >= 250:
+            return 18
+        return 1
+
     def _is_valid_clique(
         self, synapse: MaximumCliqueOfLambdaGraph, maximum_clique: typing.Any
     ) -> bool:
@@ -245,6 +257,12 @@ class Miner(BaseMinerNeuron):
             if not self._is_valid_clique(synapse, maximum_clique):
                 raise RuntimeError(
                     f"{target_label} returned invalid clique size={len(maximum_clique)}"
+                )
+            min_proxy_size = self._min_proxy_clique_size(synapse.number_of_nodes)
+            if len(maximum_clique) < min_proxy_size:
+                raise RuntimeError(
+                    f"{target_label} returned weak clique size={len(maximum_clique)} "
+                    f"below floor={min_proxy_size}"
                 )
             return maximum_clique, target_label
 
