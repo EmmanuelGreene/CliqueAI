@@ -185,7 +185,11 @@ class Miner(BaseMinerNeuron):
         if validator_timeout > 0 and validator_timeout <= 6.0:
             return min(base, 0.50), "aggressive-proxy-6s"
         if validator_timeout > 0 and validator_timeout <= 10.0:
-            return min(base, 1.00), "aggressive-proxy-short"
+            # Post-deploy shadow logs showed a 7.5s proxy answer beating local by
+            # +1 clique node only ~0.10s after the old 1.00s grace expired.  Give
+            # short-but-not-6s jobs a small extra window while keeping the safety
+            # buffer and local/proxy quality guard intact.
+            return min(base, 1.25), "aggressive-proxy-short"
         if validator_timeout > 0 and validator_timeout <= 15.0:
             return min(base, 2.50), "aggressive-proxy-medium"
         if local_elapsed is not None and validator_timeout > 0 and local_elapsed >= validator_timeout * 0.75:
