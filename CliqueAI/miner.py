@@ -66,6 +66,9 @@ class Miner(BaseMinerNeuron):
         incoming = getattr(synapse, "dendrite", None)
         spoofed_hotkey = str(getattr(self.config.neuron.proxy, "spoofed_hotkey", "") or "")
         dendrite_hotkey = spoofed_hotkey or str(getattr(incoming, "hotkey", "") or "")
+        configured_timeout = float(self.config.neuron.proxy.timeout)
+        validator_timeout = float(getattr(synapse, "timeout", 0) or 0)
+        effective_timeout = validator_timeout if validator_timeout > 0 else configured_timeout
 
         proxy_synapse = MaximumCliqueOfLambdaGraph(
             uuid=synapse.uuid,
@@ -73,7 +76,7 @@ class Miner(BaseMinerNeuron):
             number_of_nodes=synapse.number_of_nodes,
             encoded_matrix=synapse.encoded_matrix,
             maximum_clique=[],
-            timeout=synapse.timeout,
+            timeout=effective_timeout,
         )
         proxy_synapse.dendrite = bt.TerminalInfo(
             ip=str(getattr(incoming, "ip", "127.0.0.1") or "127.0.0.1"),
@@ -85,7 +88,7 @@ class Miner(BaseMinerNeuron):
         )
 
         headers = proxy_synapse.to_headers()
-        headers["timeout"] = str(float(self.config.neuron.proxy.timeout))
+        headers["timeout"] = str(effective_timeout)
         headers["name"] = "MaximumCliqueOfLambdaGraph"
         # CliqueAI targets accept validator-like dendrite metadata when the
         # signature field is present but empty. This matches the successful
@@ -94,6 +97,7 @@ class Miner(BaseMinerNeuron):
         headers["bt_header_dendrite_signature"] = ""
 
         body = proxy_synapse.model_dump()
+        body["timeout"] = effective_timeout
         if isinstance(body.get("dendrite"), dict):
             body["dendrite"]["signature"] = ""
 
@@ -102,7 +106,7 @@ class Miner(BaseMinerNeuron):
             url,
             json=body,
             headers=headers,
-            timeout=float(self.config.neuron.proxy.timeout),
+            timeout=effective_timeout,
         )
         if response.status_code != 200:
             raise RuntimeError(
