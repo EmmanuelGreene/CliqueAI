@@ -473,6 +473,16 @@ class Miner(BaseMinerNeuron):
                         try:
                             proxy_clique, target = await asyncio.wait_for(asyncio.shield(proxy_task), timeout=grace)
                             self._record_proxy_success(target)
+                            if self._is_valid_clique(synapse, local_result) and len(local_result) >= len(proxy_clique):
+                                synapse.maximum_clique = local_result
+                                bt.logging.info(
+                                    f"✅ LOCAL BEATS GRACE PROXY | local_clique_size={len(local_result)} "
+                                    f"proxy_target={target} proxy_clique_size={len(proxy_clique)} "
+                                    f"elapsed={time.time() - start_time:.2f}s local_elapsed={local_elapsed:.2f}s "
+                                    f"grace={grace:.2f}s grace_policy={grace_policy} "
+                                    f"target_stats={self._proxy_target_summary()} | {query_context}"
+                                )
+                                return synapse
                             synapse.maximum_clique = proxy_clique
                             bt.logging.info(
                                 f"✅ PROXY SUCCESS | target={target} clique_size={len(proxy_clique)} "
