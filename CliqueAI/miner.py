@@ -134,13 +134,28 @@ class Miner(BaseMinerNeuron):
         codec = GraphCodec()
         adjacency_matrix = codec.decode_matrix(synapse.encoded_matrix)
         adjacency_list = codec.matrix_to_list(adjacency_matrix)
-        return anytime_clique_algorithm(
+        seed_material = str(getattr(synapse, "uuid", "") or synapse.encoded_matrix[:64])
+        best = anytime_clique_algorithm(
             synapse.number_of_nodes,
             adjacency_list,
             deadline=deadline,
             time_limit=float(getattr(synapse, "timeout", 0) or 0) or None,
-            seed_material=str(getattr(synapse, "uuid", "") or synapse.encoded_matrix[:64]),
+            seed_material=seed_material,
         )
+        # Real-sample replay showed a cheap second deterministic seed improves
+        # clique size on several weak buckets without any observed regressions.
+        # Use the same absolute deadline, so this can only spend otherwise idle
+        # budget and still returns before the validator safety buffer.
+        if deadline is not None and deadline - time.perf_counter() > 0.35:
+            challenger = anytime_clique_algorithm(
+                synapse.number_of_nodes,
+                adjacency_list,
+                deadline=deadline,
+                seed_material=seed_material + "|a",
+            )
+            if len(challenger) > len(best):
+                best = challenger
+        return best
 
     def _local_solve_with_timing_sync(
         self, synapse: MaximumCliqueOfLambdaGraph, deadline: float | None = None
