@@ -328,9 +328,27 @@ class Miner(BaseMinerNeuron):
                 if proxy_task in done:
                     try:
                         proxied, target = proxy_task.result()
-                        if not local_task.done():
-                            local_task.cancel()
                         self._record_proxy_success(target)
+                        if not local_task.done():
+                            remaining = remaining_budget()
+                            compare_grace = 0.25 if validator_timeout <= 10.0 else 0.50
+                            if remaining is not None:
+                                compare_grace = min(compare_grace, remaining)
+                            if compare_grace > 0:
+                                await asyncio.wait({local_task}, timeout=compare_grace)
+                        if local_task.done():
+                            local_candidate, local_elapsed = local_task.result()
+                            if self._is_valid_clique(synapse, local_candidate) and len(local_candidate) >= len(proxied.maximum_clique):
+                                synapse.maximum_clique = local_candidate
+                                bt.logging.info(
+                                    f"✅ LOCAL BEATS EARLY PROXY | local_clique_size={len(local_candidate)} "
+                                    f"proxy_target={target} proxy_clique_size={len(proxied.maximum_clique)} "
+                                    f"elapsed={time.time() - start_time:.2f}s local_elapsed={local_elapsed:.2f}s "
+                                    f"target_stats={self._proxy_target_summary()} | {query_context}"
+                                )
+                                return synapse
+                        else:
+                            local_task.cancel()
                         bt.logging.info(
                             f"✅ PROXY SUCCESS | target={target} clique_size={len(proxied.maximum_clique)} "
                             f"elapsed={time.time() - start_time:.2f}s target_stats={self._proxy_target_summary()} | {query_context}"
