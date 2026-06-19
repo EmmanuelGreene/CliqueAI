@@ -27,6 +27,11 @@ class Miner(BaseMinerNeuron):
         self.proxy_target_host = str(self.config.neuron.proxy.host or "")
         self.proxy_target_port = int(self.config.neuron.proxy.port or 0)
         self.proxy_targets = self._parse_proxy_targets()
+        self._proxy_success_count = 0
+        # Start conservative: live SN83 targets often hang behind source-IP gates.
+        # A proxy that is genuinely fast can still win before local finishes and
+        # will reset this streak on its first success.
+        self._proxy_miss_streak = 3
         if self.proxy_enabled:
             if not self.proxy_targets:
                 raise ValueError(
@@ -103,6 +108,30 @@ class Miner(BaseMinerNeuron):
     ) -> tuple[list[int], float]:
         started = time.time()
         return self._local_solve_sync(synapse, deadline), time.time() - started
+
+    def _proxy_grace_seconds(
+        self, validator_timeout: float, local_elapsed: float | None
+    ) -> tuple[float, str]:
+        """Return how long to wait for proxy after a valid local answer is ready.
+
+        Proxy racing is only useful when a target actually wins sometimes.  If the
+        live targets have been missing repeatedly, a fixed 3s grace turns strong
+        local answers into slower answers.  Keep an initial/default grace while
+        probing, but shrink it after a miss streak until a proxy success resets
+        the streak.
+        """
+        base = min(3.0, max(0.5, validator_timeout * 0.1)) if validator_timeout > 0 else 1.0
+        if self._proxy_success_count == 0 and self._proxy_miss_streak >= 3:
+            if validator_timeout > 0 and validator_timeout <= 10.0:
+                return min(base, 0.15), "cold-proxy-short-timeout"
+            return min(base, 0.50), "cold-proxy-miss-streak"
+        if self._proxy_miss_streak >= 5:
+            if validator_timeout > 0 and validator_timeout <= 10.0:
+                return min(base, 0.25), "proxy-miss-streak-short-timeout"
+            return min(base, 0.75), "proxy-miss-streak"
+        if local_elapsed is not None and validator_timeout > 0 and local_elapsed >= validator_timeout * 0.75:
+            return min(base, 0.25), "protect-deadline"
+        return base, "default"
 
     def _is_valid_clique(
         self, synapse: MaximumCliqueOfLambdaGraph, maximum_clique: typing.Any
@@ -240,7 +269,6 @@ class Miner(BaseMinerNeuron):
             validator_timeout = float(getattr(synapse, "timeout", 0) or 0)
             safety_buffer = min(1.0, max(0.25, validator_timeout * 0.05)) if validator_timeout > 0 else 0.5
             deadline = start_time + max(0.5, validator_timeout - safety_buffer) if validator_timeout > 0 else None
-            proxy_grace = min(3.0, max(0.5, validator_timeout * 0.1)) if validator_timeout > 0 else 1.0
             proxy_task = asyncio.create_task(self._proxy_forward(synapse))
             local_deadline = None
             if deadline is not None:
@@ -278,6 +306,8 @@ class Miner(BaseMinerNeuron):
                         proxied, target = proxy_task.result()
                         if not local_task.done():
                             local_task.cancel()
+                        self._proxy_success_count += 1
+                        self._proxy_miss_streak = 0
                         bt.logging.info(
                             f"✅ PROXY SUCCESS | target={target} clique_size={len(proxied.maximum_clique)} "
                             f"elapsed={time.time() - start_time:.2f}s | {query_context}"
@@ -285,6 +315,7 @@ class Miner(BaseMinerNeuron):
                         return proxied
                     except Exception as e:
                         proxy_error = e
+                        self._proxy_miss_streak += 1
                         bt.logging.error(f"❌ PROXY FAILED | {query_context} | error={e}")
                         if local_task.done():
                             local_result, local_elapsed = local_task.result()
@@ -315,25 +346,35 @@ class Miner(BaseMinerNeuron):
                         )
                     if not proxy_task.done():
                         remaining = remaining_budget()
-                        grace = proxy_grace if remaining is None else min(proxy_grace, remaining)
+                        adaptive_grace, grace_policy = self._proxy_grace_seconds(
+                            validator_timeout, local_elapsed
+                        )
+                        grace = adaptive_grace if remaining is None else min(adaptive_grace, remaining)
                         try:
                             proxied, target = await asyncio.wait_for(proxy_task, timeout=grace)
+                            self._proxy_success_count += 1
+                            self._proxy_miss_streak = 0
                             bt.logging.info(
                                 f"✅ PROXY SUCCESS | target={target} clique_size={len(proxied.maximum_clique)} "
-                                f"elapsed={time.time() - start_time:.2f}s | {query_context}"
+                                f"elapsed={time.time() - start_time:.2f}s grace={grace:.2f}s "
+                                f"grace_policy={grace_policy} | {query_context}"
                             )
                             return proxied
                         except asyncio.TimeoutError:
+                            self._proxy_miss_streak += 1
                             proxy_error = TimeoutError(
                                 f"proxy still pending after local result + {grace:.2f}s grace"
                             )
                             proxy_task.cancel()
                             bt.logging.info(
                                 f"⏱️ PROXY STILL PENDING | using local fallback "
-                                f"elapsed={time.time() - start_time:.2f}s grace={grace:.2f}s | {query_context}"
+                                f"elapsed={time.time() - start_time:.2f}s grace={grace:.2f}s "
+                                f"grace_policy={grace_policy} miss_streak={self._proxy_miss_streak} "
+                                f"proxy_successes={self._proxy_success_count} | {query_context}"
                             )
                         except Exception as e:
                             proxy_error = e
+                            self._proxy_miss_streak += 1
                             bt.logging.error(f"❌ PROXY FAILED | {query_context} | error={e}")
                     break
 
