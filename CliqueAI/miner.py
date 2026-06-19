@@ -6,7 +6,7 @@ import uuid
 
 import bittensor as bt
 import httpx
-from CliqueAI.clique_algorithms import networkx_algorithm
+from CliqueAI.clique_algorithms import anytime_clique_algorithm
 from CliqueAI.graph.codec import GraphCodec
 from CliqueAI.protocol import MaximumCliqueOfLambdaGraph
 from common.base.miner import BaseMinerNeuron
@@ -84,11 +84,19 @@ class Miner(BaseMinerNeuron):
             f"timeout={timeout}"
         )
 
-    def _local_solve_sync(self, synapse: MaximumCliqueOfLambdaGraph) -> list[int]:
+    def _local_solve_sync(
+        self, synapse: MaximumCliqueOfLambdaGraph, deadline: float | None = None
+    ) -> list[int]:
         codec = GraphCodec()
         adjacency_matrix = codec.decode_matrix(synapse.encoded_matrix)
         adjacency_list = codec.matrix_to_list(adjacency_matrix)
-        return networkx_algorithm(synapse.number_of_nodes, adjacency_list)
+        return anytime_clique_algorithm(
+            synapse.number_of_nodes,
+            adjacency_list,
+            deadline=deadline,
+            time_limit=float(getattr(synapse, "timeout", 0) or 0) or None,
+            seed_material=str(getattr(synapse, "uuid", "") or synapse.encoded_matrix[:64]),
+        )
 
     def _is_valid_clique(
         self, synapse: MaximumCliqueOfLambdaGraph, maximum_clique: typing.Any
@@ -221,14 +229,19 @@ class Miner(BaseMinerNeuron):
         bt.logging.info(f"✅ REAL VALIDATOR QUERY ARRIVED | {query_context}")
 
         if self.proxy_enabled:
-            proxy_task = asyncio.create_task(self._proxy_forward(synapse))
-            local_task = asyncio.create_task(asyncio.to_thread(self._local_solve_sync, synapse))
             proxy_error: Exception | None = None
             local_result: list[int] | None = None
             validator_timeout = float(getattr(synapse, "timeout", 0) or 0)
             safety_buffer = min(1.0, max(0.25, validator_timeout * 0.05)) if validator_timeout > 0 else 0.5
             deadline = start_time + max(0.5, validator_timeout - safety_buffer) if validator_timeout > 0 else None
             proxy_grace = min(3.0, max(0.5, validator_timeout * 0.1)) if validator_timeout > 0 else 1.0
+            proxy_task = asyncio.create_task(self._proxy_forward(synapse))
+            local_deadline = None
+            if deadline is not None:
+                local_deadline = time.perf_counter() + max(0.05, deadline - time.time())
+            local_task = asyncio.create_task(
+                asyncio.to_thread(self._local_solve_sync, synapse, local_deadline)
+            )
 
             def remaining_budget() -> float | None:
                 if deadline is None:

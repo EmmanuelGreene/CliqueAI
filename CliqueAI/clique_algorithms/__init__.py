@@ -1,3 +1,4 @@
+from .anytime_algorithm import anytime_clique_algorithm
 from .networkx_algorithm import networkx_algorithm
 
 
