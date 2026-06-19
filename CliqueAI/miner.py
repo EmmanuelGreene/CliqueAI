@@ -164,7 +164,10 @@ class Miner(BaseMinerNeuron):
         return self._local_solve_sync(synapse, deadline), time.time() - started
 
     def _proxy_grace_seconds(
-        self, validator_timeout: float, local_elapsed: float | None
+        self,
+        validator_timeout: float,
+        local_elapsed: float | None,
+        number_of_nodes: int | None = None,
     ) -> tuple[float, str]:
         """Return how long to wait for proxy after a valid local answer is ready.
 
@@ -194,6 +197,13 @@ class Miner(BaseMinerNeuron):
             return min(base, 2.50), "aggressive-proxy-medium"
         if local_elapsed is not None and validator_timeout > 0 and local_elapsed >= validator_timeout * 0.75:
             return min(base, 1.00), "protect-deadline"
+        if validator_timeout >= 30.0 and (number_of_nodes or 0) >= 850:
+            # Live shadow evidence on 896-node/30s jobs showed proxy can beat
+            # local by +3 but arrive ~8s after the old 6s long-job grace.  On
+            # only these long, large graphs, spend more otherwise-idle budget;
+            # the caller still caps this by the validator safety deadline and
+            # compares proxy vs local before returning.
+            return 14.0, "aggressive-proxy-large-30s"
         return base, "aggressive-proxy-long"
 
     def _record_proxy_success(self, target: str) -> None:
@@ -471,7 +481,7 @@ class Miner(BaseMinerNeuron):
                     if not proxy_task.done():
                         remaining = remaining_budget()
                         adaptive_grace, grace_policy = self._proxy_grace_seconds(
-                            validator_timeout, local_elapsed
+                            validator_timeout, local_elapsed, synapse.number_of_nodes
                         )
                         grace = adaptive_grace if remaining is None else min(adaptive_grace, remaining)
                         try:
