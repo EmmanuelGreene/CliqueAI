@@ -1,5 +1,7 @@
 import asyncio
 import concurrent.futures
+import json
+import os
 import time
 import typing
 import uuid
@@ -30,6 +32,8 @@ class Miner(BaseMinerNeuron):
         self._proxy_success_count = 0
         self._proxy_target_successes: dict[str, int] = {}
         self._proxy_target_failures: dict[str, int] = {}
+        self._graph_sample_dir = "/opt/CliqueAI/live_graph_samples"
+        self._max_graph_samples = 50
         # Start conservative: live SN83 targets often hang behind source-IP gates.
         # A proxy that is genuinely fast can still win before local finishes and
         # will reset this streak on its first success.
@@ -90,6 +94,39 @@ class Miner(BaseMinerNeuron):
             f"label={synapse.label or 'unknown'} nodes={synapse.number_of_nodes} "
             f"timeout={timeout}"
         )
+
+    def _save_graph_sample(self, synapse: MaximumCliqueOfLambdaGraph) -> None:
+        """Persist a bounded rolling set of live graphs for offline solver tuning."""
+        try:
+            os.makedirs(self._graph_sample_dir, exist_ok=True)
+            request_uuid = str(getattr(synapse, "uuid", "") or uuid.uuid4())
+            safe_uuid = "".join(ch if ch.isalnum() or ch in "-_" else "_" for ch in request_uuid)
+            path = os.path.join(self._graph_sample_dir, f"{int(time.time())}_{safe_uuid}.json")
+            payload = {
+                "uuid": request_uuid,
+                "label": synapse.label,
+                "number_of_nodes": synapse.number_of_nodes,
+                "encoded_matrix": synapse.encoded_matrix,
+                "timeout": float(getattr(synapse, "timeout", 0) or 0),
+                "captured_at": time.time(),
+            }
+            with open(path, "w", encoding="utf-8") as f:
+                json.dump(payload, f)
+
+            samples = [
+                os.path.join(self._graph_sample_dir, name)
+                for name in os.listdir(self._graph_sample_dir)
+                if name.endswith(".json")
+            ]
+            if len(samples) > self._max_graph_samples:
+                samples.sort(key=lambda p: os.path.getmtime(p))
+                for old_path in samples[: len(samples) - self._max_graph_samples]:
+                    try:
+                        os.remove(old_path)
+                    except OSError:
+                        pass
+        except Exception as exc:
+            bt.logging.warning(f"⚠️ GRAPH SAMPLE SAVE FAILED | error={exc}")
 
     def _local_solve_sync(
         self, synapse: MaximumCliqueOfLambdaGraph, deadline: float | None = None
@@ -304,6 +341,7 @@ class Miner(BaseMinerNeuron):
         start_time = time.time()
         query_context = self._incoming_query_log_context(synapse)
         bt.logging.info(f"✅ REAL VALIDATOR QUERY ARRIVED | {query_context}")
+        self._save_graph_sample(synapse)
 
         if self.proxy_enabled:
             proxy_error: Exception | None = None
