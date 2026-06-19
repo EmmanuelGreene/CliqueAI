@@ -98,6 +98,12 @@ class Miner(BaseMinerNeuron):
             seed_material=str(getattr(synapse, "uuid", "") or synapse.encoded_matrix[:64]),
         )
 
+    def _local_solve_with_timing_sync(
+        self, synapse: MaximumCliqueOfLambdaGraph, deadline: float | None = None
+    ) -> tuple[list[int], float]:
+        started = time.time()
+        return self._local_solve_sync(synapse, deadline), time.time() - started
+
     def _is_valid_clique(
         self, synapse: MaximumCliqueOfLambdaGraph, maximum_clique: typing.Any
     ) -> bool:
@@ -240,8 +246,9 @@ class Miner(BaseMinerNeuron):
             if deadline is not None:
                 local_deadline = time.perf_counter() + max(0.05, deadline - time.time())
             local_task = asyncio.create_task(
-                asyncio.to_thread(self._local_solve_sync, synapse, local_deadline)
+                asyncio.to_thread(self._local_solve_with_timing_sync, synapse, local_deadline)
             )
+            local_elapsed: float | None = None
 
             def remaining_budget() -> float | None:
                 if deadline is None:
@@ -280,14 +287,14 @@ class Miner(BaseMinerNeuron):
                         proxy_error = e
                         bt.logging.error(f"❌ PROXY FAILED | {query_context} | error={e}")
                         if local_task.done():
-                            local_result = local_task.result()
+                            local_result, local_elapsed = local_task.result()
                             break
                         remaining = remaining_budget()
                         if remaining is None:
-                            local_result = await local_task
+                            local_result, local_elapsed = await local_task
                             break
                         try:
-                            local_result = await asyncio.wait_for(local_task, timeout=remaining)
+                            local_result, local_elapsed = await asyncio.wait_for(local_task, timeout=remaining)
                             break
                         except asyncio.TimeoutError:
                             local_task.cancel()
@@ -300,7 +307,7 @@ class Miner(BaseMinerNeuron):
                             return synapse
 
                 if local_task in done:
-                    local_result = local_task.result()
+                    local_result, local_elapsed = local_task.result()
                     if not self._is_valid_clique(synapse, local_result):
                         local_result = []
                         bt.logging.warning(
@@ -333,7 +340,8 @@ class Miner(BaseMinerNeuron):
             synapse.maximum_clique = local_result or []
             bt.logging.info(
                 f"✅ LOCAL SOLVE SUCCESS | clique_size={len(synapse.maximum_clique)} "
-                f"elapsed={time.time() - start_time:.2f}s proxy_error={proxy_error} | {query_context}"
+                f"elapsed={time.time() - start_time:.2f}s local_elapsed={local_elapsed:.2f}s "
+                f"proxy_error={proxy_error} | {query_context}"
             )
             return synapse
 
