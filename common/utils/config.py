@@ -149,6 +149,15 @@ def add_miner_args(cls, parser):
         default=0,
     )
     parser.add_argument(
+        "--neuron.proxy.targets",
+        type=str,
+        help=(
+            "Comma-separated proxy target axons host:port. When set, the miner "
+            "races all targets and uses the first valid maximum_clique response."
+        ),
+        default="",
+    )
+    parser.add_argument(
         "--neuron.proxy.timeout",
         type=float,
         help="HTTP timeout for proxy target requests.",

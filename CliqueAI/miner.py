@@ -1,4 +1,5 @@
 import asyncio
+import concurrent.futures
 import time
 import typing
 import uuid
@@ -25,20 +26,41 @@ class Miner(BaseMinerNeuron):
         self.proxy_enabled = bool(self.config.neuron.proxy.enabled)
         self.proxy_target_host = str(self.config.neuron.proxy.host or "")
         self.proxy_target_port = int(self.config.neuron.proxy.port or 0)
+        self.proxy_targets = self._parse_proxy_targets()
         if self.proxy_enabled:
-            if not self.proxy_target_host or not self.proxy_target_port:
+            if not self.proxy_targets:
                 raise ValueError(
-                    "Proxy mode requires --neuron.proxy.host and --neuron.proxy.port"
+                    "Proxy mode requires --neuron.proxy.targets or "
+                    "--neuron.proxy.host/--neuron.proxy.port"
                 )
             bt.logging.info(
-                "CliqueAI Synth-style proxy enabled: "
-                f"{self.proxy_target_host}:{self.proxy_target_port}"
+                "CliqueAI Synth-style proxy enabled: " + ",".join(
+                    f"{host}:{port}" for host, port in self.proxy_targets
+                )
             )
         self.axon.attach(
             forward_fn=self.forward_graph,
             blacklist_fn=self.backlist_graph,
             priority_fn=self.priority_graph,
         )
+
+    def _parse_proxy_targets(self) -> list[tuple[str, int]]:
+        targets: list[tuple[str, int]] = []
+        raw_targets = str(getattr(self.config.neuron.proxy, "targets", "") or "")
+        for raw_target in raw_targets.split(","):
+            raw_target = raw_target.strip()
+            if not raw_target:
+                continue
+            if ":" not in raw_target:
+                raise ValueError(f"Invalid proxy target {raw_target!r}; expected host:port")
+            host, port = raw_target.rsplit(":", 1)
+            targets.append((host.strip(), int(port)))
+
+        if self.proxy_target_host and self.proxy_target_port:
+            single_target = (self.proxy_target_host, self.proxy_target_port)
+            if single_target not in targets:
+                targets.append(single_target)
+        return targets
 
     def _short_hotkey(self, hotkey: str) -> str:
         if not hotkey:
@@ -62,7 +84,7 @@ class Miner(BaseMinerNeuron):
 
     def _proxy_forward_http_sync(
         self, synapse: MaximumCliqueOfLambdaGraph
-    ) -> list[int]:
+    ) -> tuple[list[int], str]:
         incoming = getattr(synapse, "dendrite", None)
         spoofed_hotkey = str(getattr(self.config.neuron.proxy, "spoofed_hotkey", "") or "")
         dendrite_hotkey = spoofed_hotkey or str(getattr(incoming, "hotkey", "") or "")
@@ -101,31 +123,59 @@ class Miner(BaseMinerNeuron):
         if isinstance(body.get("dendrite"), dict):
             body["dendrite"]["signature"] = ""
 
-        url = f"http://{self.proxy_target_host}:{self.proxy_target_port}/MaximumCliqueOfLambdaGraph"
-        response = httpx.post(
-            url,
-            json=body,
-            headers=headers,
-            timeout=effective_timeout,
-        )
-        if response.status_code != 200:
-            raise RuntimeError(
-                f"Proxy target HTTP {response.status_code}: {response.text[:300]}"
+        def post_to_target(target: tuple[str, int]) -> tuple[list[int], str]:
+            host, port = target
+            target_label = f"{host}:{port}"
+            url = f"http://{target_label}/MaximumCliqueOfLambdaGraph"
+            response = httpx.post(
+                url,
+                json=body,
+                headers=headers,
+                timeout=effective_timeout,
             )
+            if response.status_code != 200:
+                raise RuntimeError(
+                    f"{target_label} HTTP {response.status_code}: {response.text[:300]}"
+                )
 
-        data = response.json()
-        maximum_clique = data.get("maximum_clique")
-        if not isinstance(maximum_clique, list):
-            raise RuntimeError(f"Proxy target returned no maximum_clique; keys={sorted(data.keys())}")
-        return maximum_clique
+            data = response.json()
+            maximum_clique = data.get("maximum_clique")
+            if not isinstance(maximum_clique, list):
+                raise RuntimeError(
+                    f"{target_label} returned no maximum_clique; keys={sorted(data.keys())}"
+                )
+            return maximum_clique, target_label
+
+        errors: list[str] = []
+        executor = concurrent.futures.ThreadPoolExecutor(max_workers=len(self.proxy_targets))
+        futures = {
+            executor.submit(post_to_target, target): target for target in self.proxy_targets
+        }
+        try:
+            for future in concurrent.futures.as_completed(futures):
+                target = futures[future]
+                target_label = f"{target[0]}:{target[1]}"
+                try:
+                    result = future.result()
+                    for pending in futures:
+                        if pending is not future:
+                            pending.cancel()
+                    return result
+                except Exception as exc:
+                    errors.append(f"{target_label}: {exc}")
+        finally:
+            executor.shutdown(wait=False, cancel_futures=True)
+
+        raise RuntimeError("; ".join(errors[-5:]) or "all proxy targets failed")
 
     async def _proxy_forward(
         self, synapse: MaximumCliqueOfLambdaGraph
-    ) -> MaximumCliqueOfLambdaGraph:
-        synapse.maximum_clique = await asyncio.to_thread(
+    ) -> tuple[MaximumCliqueOfLambdaGraph, str]:
+        maximum_clique, target = await asyncio.to_thread(
             self._proxy_forward_http_sync, synapse
         )
-        return synapse
+        synapse.maximum_clique = maximum_clique
+        return synapse, target
 
     async def forward_graph(
         self, synapse: MaximumCliqueOfLambdaGraph
@@ -136,8 +186,7 @@ class Miner(BaseMinerNeuron):
 
         if self.proxy_enabled:
             try:
-                proxied = await self._proxy_forward(synapse)
-                target = f"{self.proxy_target_host}:{self.proxy_target_port}"
+                proxied, target = await self._proxy_forward(synapse)
                 bt.logging.info(
                     f"✅ PROXY SUCCESS | target={target} clique_size={len(proxied.maximum_clique)} "
                     f"elapsed={time.time() - start_time:.2f}s | {query_context}"

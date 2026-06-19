@@ -10,6 +10,7 @@
 //   CLIQUEAI_PROXY_ENABLED=true
 //   CLIQUEAI_PROXY_HOST=<target-ip>
 //   CLIQUEAI_PROXY_PORT=<target-port>
+//   CLIQUEAI_PROXY_TARGETS=<target-ip:port,target-ip:port>
 //   CLIQUEAI_PROXY_SPOOFED_HOTKEY=<validator-hotkey-to-forward-as>
 
 const walletName = process.env.CLIQUEAI_WALLET_NAME;
@@ -38,6 +39,7 @@ const minStakeArgs = (process.env.CLIQUEAI_FORCE_VALIDATOR_PERMIT || "false") ==
 const proxyEnabled = (process.env.CLIQUEAI_PROXY_ENABLED || "false") === "true";
 const proxyHost = process.env.CLIQUEAI_PROXY_HOST || "";
 const proxyPort = process.env.CLIQUEAI_PROXY_PORT || "";
+const proxyTargets = process.env.CLIQUEAI_PROXY_TARGETS || "";
 const proxyTimeout = process.env.CLIQUEAI_PROXY_TIMEOUT || "30";
 const proxySpoofedHotkey = process.env.CLIQUEAI_PROXY_SPOOFED_HOTKEY || "";
 const basePort = Number(process.env.CLIQUEAI_AXON_BASE_PORT || "8083");
@@ -58,15 +60,17 @@ function buildArgs(hotkey, port) {
   ];
 
   if (proxyEnabled) {
-    if (!proxyHost || !proxyPort) {
-      throw new Error("Proxy mode requires CLIQUEAI_PROXY_HOST and CLIQUEAI_PROXY_PORT");
+    if (!proxyTargets && (!proxyHost || !proxyPort)) {
+      throw new Error("Proxy mode requires CLIQUEAI_PROXY_TARGETS or CLIQUEAI_PROXY_HOST and CLIQUEAI_PROXY_PORT");
     }
-    args.push(
-      "--neuron.proxy.enabled",
-      "--neuron.proxy.host", proxyHost,
-      "--neuron.proxy.port", proxyPort,
-      "--neuron.proxy.timeout", proxyTimeout,
-    );
+    args.push("--neuron.proxy.enabled");
+    if (proxyTargets) {
+      args.push("--neuron.proxy.targets", proxyTargets);
+    }
+    if (proxyHost && proxyPort) {
+      args.push("--neuron.proxy.host", proxyHost, "--neuron.proxy.port", proxyPort);
+    }
+    args.push("--neuron.proxy.timeout", proxyTimeout);
     if (proxySpoofedHotkey) {
       args.push("--neuron.proxy.spoofed_hotkey", proxySpoofedHotkey);
     }
