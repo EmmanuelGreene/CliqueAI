@@ -92,6 +92,61 @@ def _ensure_maximal(clique: list[int], all_bits: int, adj_bits: Sequence[int]) -
     return _maximalize(clique, candidates, adj_bits)
 
 
+def _clique_to_bits(clique: Sequence[int]) -> int:
+    bits = 0
+    for node in clique:
+        bits |= 1 << node
+    return bits
+
+
+def _common_neighbors(clique: Sequence[int], all_bits: int, adj_bits: Sequence[int]) -> int:
+    candidates = all_bits
+    for node in clique:
+        candidates &= adj_bits[node]
+    return candidates & ~_clique_to_bits(clique)
+
+
+def _first_connected_pair(
+    candidates: int, adj_bits: Sequence[int], deadline: float
+) -> tuple[int, int] | None:
+    scan = candidates
+    while scan and time.perf_counter() < deadline:
+        lowest = scan & -scan
+        left = lowest.bit_length() - 1
+        partners = candidates & adj_bits[left] & ~((1 << (left + 1)) - 1)
+        if partners:
+            right_lowest = partners & -partners
+            return left, right_lowest.bit_length() - 1
+        scan ^= lowest
+    return None
+
+
+def _one_to_two_swap_improve(
+    clique: list[int], all_bits: int, adj_bits: Sequence[int], deadline: float
+) -> list[int]:
+    """Grow clique via cheap 1->2 swaps, then maximalize."""
+    best = clique
+    improved = True
+    while improved and time.perf_counter() < deadline:
+        improved = False
+        clique_bits = _clique_to_bits(best)
+        drop_order = sorted(best, key=lambda node: adj_bits[node].bit_count())
+        for dropped in drop_order:
+            if time.perf_counter() >= deadline:
+                break
+            base = [node for node in best if node != dropped]
+            candidates = _common_neighbors(base, all_bits, adj_bits) & ~clique_bits
+            pair = _first_connected_pair(candidates, adj_bits, deadline)
+            if pair is None:
+                continue
+            candidate = _ensure_maximal(base + [pair[0], pair[1]], all_bits, adj_bits)
+            if len(candidate) > len(best) and _is_clique(candidate, adj_bits):
+                best = candidate
+                improved = True
+                break
+    return best
+
+
 def anytime_clique_algorithm(
     number_of_nodes: int,
     adjacency_list: list[list[int]],
@@ -180,6 +235,8 @@ def anytime_clique_algorithm(
         candidate = _greedy_from_candidates(candidates, adj_bits, rng, deadline, sample_width)
         clique.extend(candidate)
         clique = _ensure_maximal(clique, all_bits, adj_bits)
+        if time.perf_counter() < deadline and len(clique) + 1 >= len(best):
+            clique = _one_to_two_swap_improve(clique, all_bits, adj_bits, deadline)
 
         if len(clique) > len(best) and _is_clique(clique, adj_bits) and _is_maximal(clique, all_bits, adj_bits):
             best = clique
