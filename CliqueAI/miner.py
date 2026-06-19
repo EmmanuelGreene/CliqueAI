@@ -294,9 +294,9 @@ class Miner(BaseMinerNeuron):
                             f"⚠️ LOCAL SOLVE INVALID CLIQUE | elapsed={time.time() - start_time:.2f}s | {query_context}"
                         )
                     if not proxy_task.done():
+                        remaining = remaining_budget()
+                        grace = proxy_grace if remaining is None else min(proxy_grace, remaining)
                         try:
-                            remaining = remaining_budget()
-                            grace = proxy_grace if remaining is None else min(proxy_grace, remaining)
                             proxied, target = await asyncio.wait_for(proxy_task, timeout=grace)
                             bt.logging.info(
                                 f"✅ PROXY SUCCESS | target={target} clique_size={len(proxied.maximum_clique)} "
@@ -304,7 +304,14 @@ class Miner(BaseMinerNeuron):
                             )
                             return proxied
                         except asyncio.TimeoutError:
+                            proxy_error = TimeoutError(
+                                f"proxy still pending after local result + {grace:.2f}s grace"
+                            )
                             proxy_task.cancel()
+                            bt.logging.info(
+                                f"⏱️ PROXY STILL PENDING | using local fallback "
+                                f"elapsed={time.time() - start_time:.2f}s grace={grace:.2f}s | {query_context}"
+                            )
                         except Exception as e:
                             proxy_error = e
                             bt.logging.error(f"❌ PROXY FAILED | {query_context} | error={e}")
