@@ -155,6 +155,20 @@ class Miner(BaseMinerNeuron):
             )
             if len(challenger) > len(best):
                 best = challenger
+        # Use a hotkey-specific deterministic seed only when there is still clear
+        # spare budget. This improves single-hotkey replay quality and prevents
+        # multiple Emmanuel hotkeys from always returning the same canonical
+        # clique, which can lose diversity reward when co-selected.
+        hotkey_seed = str(getattr(getattr(self.config, "wallet", None), "hotkey", "") or "")
+        if hotkey_seed and deadline is not None and deadline - time.perf_counter() > 1.0:
+            challenger = anytime_clique_algorithm(
+                synapse.number_of_nodes,
+                adjacency_list,
+                deadline=deadline,
+                seed_material=seed_material + "|" + hotkey_seed,
+            )
+            if len(challenger) > len(best):
+                best = challenger
         return best
 
     def _local_solve_with_timing_sync(
