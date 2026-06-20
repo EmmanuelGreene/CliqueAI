@@ -4,13 +4,21 @@ import time
 from collections.abc import Sequence
 
 
-def _maximalize(clique: list[int], candidates: int, adj_bits: Sequence[int]) -> list[int]:
+def _maximalize(
+    clique: list[int],
+    candidates: int,
+    adj_bits: Sequence[int],
+    deadline: float | None = None,
+) -> list[int]:
     """Extend a clique until no remaining node connects to every clique node."""
     while candidates:
+        if deadline is not None and time.perf_counter() >= deadline:
+            break
         # Prefer nodes that keep the largest future candidate set.
         best_node = -1
         best_score = -1
         scan = candidates
+        seen = 0
         while scan:
             lowest = scan & -scan
             node = lowest.bit_length() - 1
@@ -19,6 +27,11 @@ def _maximalize(clique: list[int], candidates: int, adj_bits: Sequence[int]) -> 
                 best_node = node
                 best_score = score
             scan ^= lowest
+            seen += 1
+            if seen % 128 == 0 and deadline is not None and time.perf_counter() >= deadline:
+                break
+        if best_node < 0:
+            break
         clique.append(best_node)
         candidates &= adj_bits[best_node]
     return clique
@@ -62,7 +75,7 @@ def _greedy_from_candidates(
         _, node = best[rng.randrange(top_k)]
         clique.append(node)
         candidates &= adj_bits[node]
-    return _maximalize(clique, candidates, adj_bits)
+    return _maximalize(clique, candidates, adj_bits, deadline)
 
 
 def _is_clique(clique: Sequence[int], adj_bits: Sequence[int]) -> bool:
@@ -83,13 +96,18 @@ def _is_maximal(clique: Sequence[int], all_bits: int, adj_bits: Sequence[int]) -
     return candidates == 0
 
 
-def _ensure_maximal(clique: list[int], all_bits: int, adj_bits: Sequence[int]) -> list[int]:
+def _ensure_maximal(
+    clique: list[int],
+    all_bits: int,
+    adj_bits: Sequence[int],
+    deadline: float | None = None,
+) -> list[int]:
     candidates = all_bits
     for node in clique:
         candidates &= adj_bits[node]
     for node in clique:
         candidates &= ~(1 << node)
-    return _maximalize(clique, candidates, adj_bits)
+    return _maximalize(clique, candidates, adj_bits, deadline)
 
 
 def _clique_to_bits(clique: Sequence[int]) -> int:
@@ -139,7 +157,7 @@ def _one_to_two_swap_improve(
             pair = _first_connected_pair(candidates, adj_bits, deadline)
             if pair is None:
                 continue
-            candidate = _ensure_maximal(base + [pair[0], pair[1]], all_bits, adj_bits)
+            candidate = _ensure_maximal(base + [pair[0], pair[1]], all_bits, adj_bits, deadline)
             if len(candidate) > len(best) and _is_clique(candidate, adj_bits):
                 best = candidate
                 improved = True
@@ -244,7 +262,7 @@ def anytime_clique_algorithm(
         candidates = adj_bits[start]
         candidate = _greedy_from_candidates(candidates, adj_bits, rng, deadline, sample_width)
         clique.extend(candidate)
-        clique = _ensure_maximal(clique, all_bits, adj_bits)
+        clique = _ensure_maximal(clique, all_bits, adj_bits, deadline)
         if time.perf_counter() < deadline and len(clique) + 1 >= len(best):
             clique = _one_to_two_swap_improve(clique, all_bits, adj_bits, deadline)
 
