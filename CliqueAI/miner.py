@@ -454,7 +454,35 @@ class Miner(BaseMinerNeuron):
                                 )
                                 return synapse
                         else:
-                            local_task.cancel()
+                            # Do not cancel rare proxy-winning requests. Let local finish in
+                            # the background so we can measure whether proxy actually beat
+                            # the same graph instead of only measuring proxy availability.
+                            def _log_late_local_result(task: asyncio.Task) -> None:
+                                try:
+                                    local_candidate, late_local_elapsed = task.result()
+                                    local_valid = self._is_valid_clique(synapse, local_candidate)
+                                    local_size = len(local_candidate) if local_valid else -1
+                                    delta = len(proxy_clique) - local_size if local_valid else "invalid-local"
+                                    bt.logging.info(
+                                        f"🧪 SHADOW LOCAL COMPLETED | proxy_target={target} "
+                                        f"proxy_clique_size={len(proxy_clique)} local_clique_size={local_size} "
+                                        f"delta={delta} local_elapsed={late_local_elapsed:.2f}s "
+                                        f"elapsed={time.time() - start_time:.2f}s "
+                                        f"target_stats={self._proxy_target_summary()} | {query_context}"
+                                    )
+                                except asyncio.CancelledError:
+                                    bt.logging.info(
+                                        f"🧪 SHADOW LOCAL CANCELLED | proxy_target={target} "
+                                        f"proxy_clique_size={len(proxy_clique)} elapsed={time.time() - start_time:.2f}s | {query_context}"
+                                    )
+                                except Exception as exc:
+                                    bt.logging.warning(
+                                        f"🧪 SHADOW LOCAL FAILED | proxy_target={target} "
+                                        f"proxy_clique_size={len(proxy_clique)} elapsed={time.time() - start_time:.2f}s "
+                                        f"error={exc} | {query_context}"
+                                    )
+
+                            local_task.add_done_callback(_log_late_local_result)
                         synapse.maximum_clique = proxy_clique
                         bt.logging.info(
                             f"✅ PROXY SUCCESS | target={target} clique_size={len(proxy_clique)} "
